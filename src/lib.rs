@@ -1,28 +1,22 @@
-use std::mem::MaybeUninit;
 use std::ops::Deref;
 
-use windows::runtime::{Interface, GUID};
-use windows::Win32::Foundation::{PSTR, PWSTR};
-use windows::Win32::Globalization::{WideCharToMultiByte, CP_UTF8};
-use windows::Win32::Media::Audio::CoreAudio::{
-    IAudioSessionControl, IAudioSessionEnumerator, IAudioSessionManager2, ISimpleAudioVolume,
-};
-use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::System::PropertiesSystem::PropVariantToStringAlloc;
-use windows::Win32::{
-    Media::Audio::CoreAudio::{
-        eRender, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, MMDeviceEnumerator,
-        DEVICE_STATE_ACTIVE,
+use windows::Win32::Devices::FunctionDiscovery::PKEY_DeviceInterface_FriendlyName;
+use windows::Win32::System::Com::STGM_READ;
+use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY};
+use windows::{
+    core::{Interface, GUID, PWSTR},
+    Win32::{
+        Media::Audio::{
+            eRender, IAudioSessionControl, IAudioSessionEnumerator, IAudioSessionManager2,
+            IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator, ISimpleAudioVolume,
+            MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+        },
+        System::Com::{
+            CoCreateInstance, CoTaskMemFree, StructuredStorage::PropVariantToStringAlloc,
+            CLSCTX_ALL,
+        },
     },
-    System::{
-        Com::{CoCreateInstance, CLSCTX_ALL},
-        PropertiesSystem::IPropertyStore,
-    },
 };
-
-const GUID_IAUDIO_SESSION_MANAGER2: &str = "77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F";
-const PKEY_DEVICE_INTERFACE_FRIENDLY_NAME: &str = "a45c254e-df1c-4efd-8020-67d146a850e0";
-const STGM_READ: u32 = 0x00000000;
 
 struct ComMemPtr<T: AsComMemPtr> {
     value: T,
@@ -51,7 +45,7 @@ where
 {
     fn drop(&mut self) {
         unsafe {
-            CoTaskMemFree(self.get_com_ptr());
+            CoTaskMemFree(Some(self.get_com_ptr()));
         }
     }
 }
@@ -63,58 +57,6 @@ trait AsComMemPtr {
 impl AsComMemPtr for PWSTR {
     fn get_com_ptr(&self) -> *const std::ffi::c_void {
         self.0 as *const _
-    }
-}
-
-#[allow(dead_code)]
-fn pwstr_to_string(input: PWSTR) -> String {
-    // TODO: Seems like we keep a 0-terminator in the output
-    // This causes a problem for direct comparisons.
-    unsafe {
-        let null_pstr: PSTR = PSTR(std::ptr::null_mut());
-        let required_bytes: i32 = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            input,
-            -1,
-            null_pstr,
-            0,
-            null_pstr,
-            std::ptr::null_mut(),
-        );
-        assert!(required_bytes >= 0);
-        let mut result = String::with_capacity(required_bytes as usize);
-        let transformed_bytes = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            input,
-            -1,
-            PSTR(result.as_mut_ptr()),
-            required_bytes,
-            null_pstr,
-            std::ptr::null_mut(),
-        );
-        result.as_mut_vec().set_len(transformed_bytes as usize);
-
-        assert_eq!(transformed_bytes, required_bytes);
-        result
-    }
-}
-
-#[allow(dead_code)]
-fn pwstr_to_string2(input: PWSTR) -> String {
-    unsafe {
-        if input.0.is_null() {
-            return String::new();
-        }
-        let mut end = input.0;
-        while *end != 0 {
-            end = end.add(1);
-        }
-        String::from_utf16_lossy(std::slice::from_raw_parts(
-            input.0,
-            end.offset_from(input.0) as _,
-        ))
     }
 }
 
@@ -162,7 +104,7 @@ where
         let iterator = AudioSessionIterator::new(&session_manager);
         for session in iterator {
             let name: ComMemPtr<_> = session.GetDisplayName().unwrap().into();
-            if pred(&pwstr_to_string2(*name)) {
+            if pred(&name.to_string().unwrap()) {
                 return Ok(session);
             }
         }
@@ -177,25 +119,20 @@ pub fn applications_for_device(device: &IMMDevice) -> Vec<String> {
         let iterator = AudioSessionIterator::new(&session_manager);
         for session in iterator {
             let name: ComMemPtr<_> = session.GetDisplayName().unwrap().into();
-            result.push(pwstr_to_string2(*name));
+            result.push(name.to_string().unwrap());
         }
     }
     result
 }
 
 fn get_session_manager(device: &IMMDevice) -> IAudioSessionManager2 {
-    let mut session_manager = MaybeUninit::<IAudioSessionManager2>::uninit();
-    let guid: GUID = GUID_IAUDIO_SESSION_MANAGER2.into();
     unsafe {
         device
             .Activate(
-                &guid,
-                0u32,
-                std::ptr::null(),
-                std::ptr::addr_of_mut!(session_manager) as *mut *mut _,
+                CLSCTX_ALL,
+                None,
             )
-            .unwrap();
-        session_manager.assume_init()
+            .unwrap()
     }
 }
 
@@ -207,12 +144,13 @@ where
         let count = prop_store.GetCount().unwrap();
 
         for i in 0..count {
-            let key = prop_store.GetAt(i).unwrap();
-            if key.fmtid == PKEY_DEVICE_INTERFACE_FRIENDLY_NAME.into() {
+            let mut key: PROPERTYKEY = Default::default();
+            prop_store.GetAt(i, &mut key as *mut PROPERTYKEY).unwrap();
+            if key.fmtid == PKEY_DeviceInterface_FriendlyName.fmtid {
                 let prop_var = prop_store.GetValue(&key).unwrap();
                 let raw_string_alloced: ComMemPtr<_> =
-                    PropVariantToStringAlloc(&prop_var).unwrap().into();
-                if pred(&pwstr_to_string2(*raw_string_alloced)) {
+                PropVariantToStringAlloc(&prop_var).unwrap().into();
+                if pred(&raw_string_alloced.to_string().unwrap()) {
                     return true;
                 }
             }
